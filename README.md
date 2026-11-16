@@ -72,8 +72,17 @@ theme: auto         # dark | light | auto
 
 ## Installation
 
-Manual for now: copy `dist/sf-copilot.js` to `/config/www/sf-copilot/`, add the resource `/local/sf-copilot/sf-copilot.js` (JavaScript
-module) in Settings → Dashboards → Resources, then add the card.
+**With HACS** (recommended): HACS → ⋮ → *Custom repositories* → add `https://github.com/khrom06/SF-Copilot`, type **Dashboard** → download
+**SF Copilot** → reload the page. HACS adds the resource for you.
+
+**By hand:** copy `dist/sf-copilot.js` to `/config/www/sf-copilot/`, add the resource `/local/sf-copilot/sf-copilot.js` (JavaScript
+module) in Settings → Dashboards → Resources.
+
+Then add the card:
+
+```yaml
+type: custom:sf-copilot-card
+```
 
 Requires Home Assistant with the recorder and logbook (on by default). French and English.
 
