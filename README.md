@@ -6,6 +6,8 @@ the same delay — and proposes the automation, with the evidence, a dry run and
 
 No cloud, no AI model, no data leaving the house: plain statistics in your browser, on the history Home Assistant already keeps.
 
+<p align="center"><img src="assets/copilot.webp" alt="SF Copilot: three habits found, a dry run, then the automation created in two presses" width="420"></p>
+
 ```yaml
 type: custom:sf-copilot-card
 ```
@@ -19,6 +21,10 @@ automations, because nobody notices them any more.
 SF Copilot starts from the other end: **from what the people in the house actually do**, and only that.
 
 ## What it finds
+
+<p align="center"><img src="assets/dark.png" alt="Dark theme" width="340"> &nbsp; <img src="assets/light.png" alt="Light theme" width="340"></p>
+
+*Invented house ("Alex"): the habits above are made-up data, not a real home.*
 
 | Habit | Example | The automation it proposes |
 |---|---|---|
