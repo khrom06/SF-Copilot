@@ -1,0 +1,169 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- Card test: loaded by run.sh in headless Chrome against a fake Home Assistant (states, logbook, automation API, user data).
+     Writes its verdict (JSON) into #result. -->
+<body>
+<script>
+class FakeIcon extends HTMLElement {} customElements.define("ha-icon", FakeIcon);
+window.__errors = [];
+window.addEventListener("error", (e) => window.__errors.push(`${e.message} @${(e.filename || "").split("/").pop()}:${e.lineno}`));
+window.addEventListener("unhandledrejection", (e) => window.__errors.push(`unhandled rejection: ${e.reason && e.reason.message || e.reason}`));
+</script>
+<script src="../dist/sf-copilot.js"></script>
+<script>
+const failures = []; let checks = 0;
+const ok = (c, m) => { checks++; if (!c) failures.push(m); };
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const idle = (el) => until(() => !el._doing).then(() => wait(20));
+const until = async (f, ms = 3000) => { const t = Date.now(); while (Date.now() - t < ms) { if (f()) return true; await wait(20); } return false; };
+const DAY = 86400000, MIN = 60000, NOW = Date.now(), USER = "u-alex", SYS = "u-service";
+let seed = 7; const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; };
+const day = (k) => { const d = new Date(NOW); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - k); return d.getTime(); };
+const isWe = (t) => [0, 6].includes(new Date(t).getDay());
+// 21 days of history: the desk lamp turned on by Alex around 19:20 on weekdays, the hall light after the door opens, the screensaver
+// that flips every 30 s (noise), the heating switched by Node-RED (a service account), a lamp that comes back online (no context).
+function history() {
+  const L = [], push = (e, s, t, ctx) => L.push({ entity_id: e, state: s, when: t / 1000, ...(ctx || {}) }), me = { context_user_id: USER, context_event_type: "call_service", context_domain: "light" };
+  for (let k = 1; k <= 21; k++) {
+    const d = day(k);
+    push("light.desk", "off", d + 2 * 3600000, { context_event_type: "automation_triggered", context_domain: "automation" });
+    if (!isWe(d) && k % 6 !== 0) push("light.desk", "on", d + (19 * 60 + 20 + Math.round(rnd() * 16 - 8)) * MIN, me);
+    const t = d + (17 * 60 + Math.round(rnd() * 200)) * MIN; push("binary_sensor.door", "on", t); push("binary_sensor.door", "off", t + 30000);
+    push("light.hall", "off", d + 3600000, { context_event_type: "automation_triggered", context_domain: "automation" }); if (k % 9 !== 0) push("light.hall", "on", t + 20000 + Math.round(rnd() * 20000), me);
+    push("switch.heat", "on", d + 6 * 3600000, { context_user_id: SYS, context_event_type: "call_service", context_domain: "switch" }); push("switch.heat", "off", d + 8 * 3600000, { context_user_id: SYS, context_event_type: "call_service", context_domain: "switch" });
+    push("light.flaky", "off", d + 21 * 3600000); push("light.flaky", "on", d + 21 * 3600000 + 60000);
+  }
+  for (let t = NOW - 21 * DAY; t < NOW; t += 30000) push("switch.screensaver", (t / 30000) % 2 ? "on" : "off", t);
+  return L;
+}
+const HIST = history();
+const S = (state, attrs = {}) => ({ state, attributes: attrs, last_changed: new Date(NOW - 3600000).toISOString() });
+function makeHass(opts = {}) {
+  const states = { "light.desk": S("off", { friendly_name: opts.evilName || "Desk lamp" }), "light.hall": S("off", { friendly_name: "Hall light" }), "binary_sensor.door": S("off", { friendly_name: "Front door", device_class: "door" }),
+    "switch.heat": S("off", { friendly_name: "Heating" }), "light.flaky": S("on", { friendly_name: "Flaky lamp" }), "switch.screensaver": S("on", { friendly_name: "Screensaver" }),
+    "person.alex": S("home", { user_id: USER, friendly_name: "Alex" }), "sensor.temp": S("20", { unit_of_measurement: "°C" }), ...(opts.extra || {}) };
+  for (const [id, s] of Object.entries(states)) s.entity_id = id;
+  const log = { ws: [], api: [], userData: opts.userData || null };
+  const h = { states, entities: {}, locale: { language: opts.lang || "fr" }, language: opts.lang || "fr", user: { id: USER, is_admin: opts.admin !== false }, themes: { darkMode: true },
+    config: { latitude: 44.84, longitude: -0.58 }, __log: log,
+    callWS: async (m) => { log.ws.push(m);
+      if (opts.wsFail) throw new Error("logbook down");
+      if (m.type === "logbook/get_events") { const a = Date.parse(m.start_time) / 1000, b = Date.parse(m.end_time) / 1000, ids = new Set(m.entity_ids); return HIST.filter((x) => ids.has(x.entity_id) && x.when >= a && x.when <= b); }
+      if (m.type === "frontend/get_user_data") return { value: log.userData };
+      if (m.type === "frontend/set_user_data") { log.userData = m.value; return null; }
+      throw new Error("unknown " + m.type); },
+    callApi: async (method, path, body) => { log.api.push({ method, path, body }); if (opts.apiFail) { const e = new Error("forbidden"); throw e; } return { result: "ok" }; } };
+  return h;
+}
+const mount = (cfg, h) => { const el = document.createElement("sf-copilot-card"); el.setConfig(cfg || {}); document.body.appendChild(el); el.hass = h; return el; };
+const txt = (el) => el.shadowRoot.textContent.replace(/\s+/g, " ");
+const btns = (el, k) => [...el.shadowRoot.querySelectorAll(`button[data-k="${k}"]`)];
+const card = (el, re) => [...el.shadowRoot.querySelectorAll(".p")].find((p) => re.test(p.querySelector(".ti").textContent));
+
+(async () => { try {
+  // 1. Scan: two logbook requests, the noisy entity left out of the second one, the habits found, nothing created.
+  { const h = makeHass(), el = mount({}, h);
+    ok(/Lecture de l'historique/.test(txt(el)), "a loading message is shown first");
+    ok(await until(() => el._res), "the scan finishes");
+    const lb = h.__log.ws.filter((m) => m.type === "logbook/get_events");
+    ok(lb.length === 2, "two logbook requests (2 days, then the whole period), got " + lb.length);
+    ok(lb[0].entity_ids.includes("switch.screensaver") && !lb[1].entity_ids.includes("switch.screensaver"), "an entity that changes all the time is left out of the full request");
+    ok(!lb[0].entity_ids.includes("sensor.temp"), "entities that can neither be commanded nor start a habit are not requested");
+    ok(lb[1].entity_ids.includes("binary_sensor.door"), "door sensors are read as possible triggers");
+    ok(Math.abs(Date.parse(lb[1].start_time) - (NOW - 21 * DAY)) < 120000, "21 days are read by default");
+    const t = txt(el);
+    ok(/Allumer Desk lamp à 19:[12]\d, en semaine/.test(t), "the weekday habit is shown as a sentence: " + t.slice(0, 400));
+    ok(/Allumer Hall light quand Front door passe à « on »/.test(t), "the after-the-door habit is shown: " + t.slice(0, 600));
+    ok(!/Heating|Flaky|Screensaver/.test(t), "what a service account, a device coming back online or a screensaver does is not a habit");
+    ok(/Fait à la main \d+ jours sur \d+/.test(t) && el.shadowRoot.querySelectorAll(".strip i.hit").length >= 10, "the evidence is shown (count and day strip)");
+    ok(h.__log.api.length === 0, "nothing is created by a scan");
+    // re-rendering: unrelated state changes do not rewrite the card, and never start a new scan
+    let writes = 0; new MutationObserver((m) => { writes += m.length; }).observe(el.shadowRoot, { childList: true });
+    for (let i = 0; i < 20; i++) { h.states = { ...h.states, "sensor.temp": S(String(20 + i)) }; el.hass = { ...h }; } await wait(80);
+    ok(writes === 0, "unrelated state changes must not rewrite the card, got " + writes); ok(h.__log.ws.filter((m) => m.type === "logbook/get_events").length === 2, "hass updates never start a new scan");
+    el.remove(); }
+  // 2. Dry run, create (two presses), trial shown, promote, stop.
+  { const h = makeHass(), el = mount({}, h); await until(() => el._res);
+    const pc = () => card(el, /Desk lamp/), id = pc().querySelector("[data-id]").dataset.id;
+    pc().querySelector('[data-k="trial"]').click(); await until(() => h.__log.api.length === 1); await idle(el);
+    const a = h.__log.api[0];
+    ok(a && a.method === "POST" && a.path === `config/automation/config/sf_copilot_trial_${id}`, "dry run: POST of the card's own trial automation, got " + JSON.stringify(a && [a.method, a.path]));
+    ok(a && a.body.actions.length === 1 && a.body.actions[0].action === "logbook.log" && !JSON.stringify(a.body).includes("turn_on"), "dry run: the automation only writes in the logbook");
+    ok(a && a.body.triggers[0].trigger === "time" && /^SF Copilot · Allumer Desk lamp/.test(a.body.alias), "dry run: time trigger and a readable name");
+    // create: the first press only arms the button
+    pc().querySelector('[data-k="create"]').click(); await wait(30);
+    ok(h.__log.api.length === 1, "create: the first press must not create anything");
+    ok(pc().querySelector('[data-k="create"]').textContent === "Confirmer ?", "create: the first press asks for confirmation");
+    pc().querySelector('[data-k="create"]').click(); await until(() => h.__log.api.length === 2); await idle(el);
+    const c = h.__log.api[1]; ok(c && c.path === `config/automation/config/sf_copilot_${id}` && c.body.actions[0].action === "light.turn_on" && c.body.actions[0].target.entity_id === "light.desk", "create: the second press creates the real automation");
+    // the confirmation expires
+    const pl = () => card(el, /Hall light/); pl().querySelector('[data-k="create"]').click(); await wait(4300); await wait(30);
+    ok(pl().querySelector('[data-k="create"]').textContent !== "Confirmer ?", "create: the confirmation expires after 4 s");
+    pl().querySelector('[data-k="create"]').click(); await wait(30); ok(h.__log.api.length === 2, "create: a press after the expiry arms again, it does not create");
+    // the trial appears in Home Assistant: shown as on trial, with promote and stop
+    h.states = { ...h.states, "automation.sf_copilot_trial": { entity_id: "automation.sf_copilot_trial", state: "on", attributes: { id: `sf_copilot_trial_${id}`, last_triggered: new Date(NOW - 2 * 3600000).toISOString() }, last_changed: new Date(NOW - 3 * DAY).toISOString() } };
+    el.hass = { ...h }; await wait(40);
+    ok(pc().classList.contains("trial") && /À l'essai depuis il y a 3 j · aurait agi il y a 2 h/.test(pc().textContent.replace(/\s+/g, " ")), "a trial is shown with when it would have acted: " + pc().textContent.replace(/\s+/g, " ").slice(0, 300));
+    ok(pc().querySelector('[data-k="promote"]') && pc().querySelector('[data-k="stop"]') && !pc().querySelector('[data-k="trial"]'), "a trial offers promote and stop");
+    pc().querySelector('[data-k="promote"]').click(); await wait(30); ok(h.__log.api.length === 2, "promote needs two presses");
+    pc().querySelector('[data-k="promote"]').click(); await until(() => h.__log.api.length === 4);
+    ok(h.__log.api[2].method === "POST" && h.__log.api[2].path === `config/automation/config/sf_copilot_${id}` && h.__log.api[3].method === "DELETE" && h.__log.api[3].path === `config/automation/config/sf_copilot_trial_${id}`, "promote: create the real one, then delete the trial");
+    // the real one exists: only an "open" button
+    h.states = { ...h.states, "automation.sf_copilot_real": { entity_id: "automation.sf_copilot_real", state: "on", attributes: { id: `sf_copilot_${id}` }, last_changed: new Date().toISOString() } }; delete h.states["automation.sf_copilot_trial"];
+    el.hass = { ...h }; await wait(40);
+    ok(pc().classList.contains("done") && /Automatisation créée/.test(pc().textContent) && pc().querySelector('[data-k="open"]') && !pc().querySelector('[data-k="create"]'), "a created automation is shown as done, with a link");
+    let more = null; el.addEventListener("hass-more-info", (e) => { more = e.detail.entityId; }); pc().querySelector('[data-k="open"]').click(); ok(more === "automation.sf_copilot_real", "open shows the automation's dialog");
+    ok(h.__log.api.every((x) => /^config\/automation\/config\/sf_copilot_/.test(x.path)), "only the card's own automations are ever written");
+    el.remove(); }
+  // 3. Ignore: per user, remembered, can be undone.
+  { const h = makeHass(), el = mount({}, h); await until(() => el._res); await wait(30);
+    card(el, /Hall light/).querySelector('[data-k="ignore"]').click(); await until(() => h.__log.userData); await idle(el);
+    ok(h.__log.userData && h.__log.userData.ignored.length === 1, "ignore is saved in the user's Home Assistant data");
+    ok(!card(el, /Hall light/) && /1 ignorée/.test(txt(el)), "an ignored proposal disappears and is counted");
+    el.remove(); const el2 = mount({}, h); await until(() => el2._res); await wait(30);
+    ok(!card(el2, /Hall light/), "ignored proposals stay hidden on the next load");
+    btns(el2, "unignore")[0].click(); await wait(30); ok(card(el2, /Hall light/) && h.__log.userData.ignored.length === 0, "show them again restores them"); el2.remove(); }
+  // 4. Not an administrator: the proposals, no buttons that would fail.
+  { const h = makeHass({ admin: false }), el = mount({}, h); await until(() => el._res);
+    ok(/Desk lamp/.test(txt(el)) && !btns(el, "create").length && !btns(el, "trial").length && /Seul un administrateur/.test(txt(el)), "non-admin: proposals without create buttons, and why"); el.remove(); }
+  // 5. Errors: logbook down (message, retry, no burst), API refused (message on the proposal).
+  { const h = makeHass({ wsFail: true }), el = mount({}, h); await until(() => el._err);
+    ok(/Historique illisible : logbook down/.test(txt(el)) && el.shadowRoot.querySelector('[role="alert"]'), "a failed scan says so");
+    const nLb = () => h.__log.ws.filter((m) => m.type === "logbook/get_events").length;
+    for (let i = 0; i < 20; i++) el.hass = { ...h }; await wait(50); ok(nLb() === 1, "a failed scan is not retried on every hass update, got " + nLb());
+    btns(el, "rescan")[0].click(); await wait(50); ok(nLb() === 2, "retry scans again"); el.remove();
+    const h2 = makeHass({ apiFail: true }), e2 = mount({}, h2); await until(() => e2._res);
+    card(e2, /Desk lamp/).querySelector('[data-k="trial"]').click(); await until(() => /Échec : forbidden/.test(txt(e2)));
+    ok(/Échec : forbidden/.test(txt(e2)) && card(e2, /Desk lamp/).querySelector('[data-k="trial"]'), "a refused creation says so and can be tried again"); e2.remove(); }
+  // 6. Hostile names, English, empty house, options.
+  { const h = makeHass({ evilName: "<img src=x onerror=window.__pwn=1>" }), el = mount({}, h); await until(() => el._res); await wait(30);
+    ok(!el.shadowRoot.querySelector("img") && !window.__pwn && /<img src=x/.test(txt(el)), "a hostile friendly name is shown as text"); el.remove();
+    const en = mount({}, makeHass({ lang: "en" })); await until(() => en._res); ok(/Turn on Desk lamp at \d+:\d+\s*(PM)?, on weekdays/.test(txt(en)) && /Dry run/.test(txt(en)), "English texts: " + txt(en).slice(0, 200)); en.remove();
+    const ex = mount({ exclude: ["light.desk", "nonsense id"] }, makeHass()); await until(() => ex._res); ok(!/Desk lamp/.test(txt(ex)) && /Hall light/.test(txt(ex)), "exclude removes an entity"); ex.remove();
+    const mx = mount({ max: 1 }, makeHass()); await until(() => mx._res); ok(mx.shadowRoot.querySelectorAll(".p").length === 1, "max limits the list"); mx.remove();
+    const hq = makeHass(); hq.states = Object.fromEntries(Object.entries(hq.states).filter(([id]) => !/desk|hall/.test(id))); const q = mount({}, hq); await until(() => q._res);
+    ok(/Aucune habitude assez régulière/.test(txt(q)) && /actions faites à la main en \d+ jours/.test(txt(q)), "a house without habits says so, with the numbers: " + txt(q).slice(0, 300)); q.remove();
+    for (const bad of [{ days: "x", max: -3, exclude: "light.a", theme: "pink", physical: "yes" }, { days: 1000 }]) { try { const b = mount(bad, makeHass()); await until(() => b._res); ok(!/undefined|NaN|\[object/.test(txt(b)), "odd options give a clean card"); b.remove(); } catch (e) { failures.push("odd options throw: " + e.message); } }
+    let threw = false; try { document.createElement("sf-copilot-card").setConfig(null); } catch (e) { threw = true; } ok(threw, "a missing config is refused clearly");
+    const lt = makeHass(); lt.themes = { darkMode: false }; const l = mount({}, lt); await wait(20); ok(l.getAttribute("theme") === "light", "theme auto follows Home Assistant"); l.remove();
+    ok((window.customCards || []).some((c) => c.type === "sf-copilot-card"), "listed in the card picker"); }
+  // 6b. Less clear habits: a weaker routine (7 weekdays of 15) only appears when asked, without reading the history again.
+  { const h = makeHass(); h.states = Object.fromEntries(Object.entries(h.states).filter(([id]) => !/desk|hall/.test(id)));
+    h.states["light.reading"] = { entity_id: "light.reading", state: "off", attributes: { friendly_name: "Reading lamp" } };
+    const me = { context_user_id: USER, context_event_type: "call_service", context_domain: "light" }; let n = 0;
+    for (let k = 1; k <= 21; k++) { const d = day(k); if (isWe(d)) continue; n++; HIST.push({ entity_id: "light.reading", state: "off", when: (d + 3600000) / 1000, context_event_type: "automation_triggered", context_domain: "automation" }); if (n % 2 === 0 && n < 16) HIST.push({ entity_id: "light.reading", state: "on", when: (d + (21 * 60 + Math.round(rnd() * 10)) * MIN) / 1000, ...me }); }
+    const el = mount({}, h); await until(() => el._res); await wait(20);
+    ok(!/Reading lamp/.test(txt(el)) && /Aucune habitude/.test(txt(el)), "a weak routine is not proposed by default");
+    const before = h.__log.ws.filter((m) => m.type === "logbook/get_events").length;
+    btns(el, "loose")[0].click(); await wait(30);
+    ok(/Allumer Reading lamp à 21:/.test(txt(el)), "less clear habits: the weak routine appears: " + txt(el).slice(0, 300));
+    ok(h.__log.ws.filter((m) => m.type === "logbook/get_events").length === before, "less clear habits: the history is not read again");
+    btns(el, "loose")[0].click(); await wait(30); ok(!/Reading lamp/.test(txt(el)), "only clear habits again"); el.remove(); }
+  // 7. Removed while a confirmation is armed: no timer left behind.
+  { const h = makeHass(), el = mount({}, h); await until(() => el._res); card(el, /Desk lamp/).querySelector('[data-k="create"]').click(); el.remove();
+    ok(el._armT === null && el._armed === null, "removing the card clears the pending confirmation"); }
+  for (const e of window.__errors) failures.push("JavaScript error: " + e);
+} catch (e) { failures.push("the test crashed: " + (e && e.stack || e)); }
+finally { const out = document.createElement("pre"); out.id = "result"; out.textContent = JSON.stringify({ ok: failures.length === 0, checks, failures }); document.body.appendChild(out); }
+})();
+</script>

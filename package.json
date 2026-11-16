@@ -1,0 +1,14 @@
+{
+  "name": "sf-copilot",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Build tooling for SF-Copilot (no runtime dependency: HACS loads dist/ directly, no bundler).",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:check": "node scripts/build.mjs --check",
+    "test": "./test/run.sh"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
