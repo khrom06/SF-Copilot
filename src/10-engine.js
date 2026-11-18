@@ -23,13 +23,16 @@ const SFCP_CONTEXT = { binary_sensor: ["on", "off"], person: ["home", "not_home"
 // Who caused a logbook entry: "human" = a person (one of `humans`, the user ids of the person entities) called a service directly from a
 // dashboard, the app or voice; "auto" = an automation, a script (even one a person started: its timing is the script's), a service account
 // (Node-RED, AppDaemon… run as system users) or anything else with a context; "physical" = no context at all.
-function sfcpCause(x, humans) {
-  if (!x || typeof x !== "object") return "auto";
+function sfcpWhy(x, humans) {
+  if (!x || typeof x !== "object") return { cause: "auto", why: "other" };
   const u = x.context_user_id, et = x.context_event_type, dom = x.context_domain;
-  if (!u && !et && !dom) return "physical";
-  if (u && humans && humans.has(u) && et === "call_service" && dom !== "script" && dom !== "automation") return "human";
-  return "auto";
+  if (!u && !et && !dom) return { cause: "physical", why: "physical" };
+  if (dom === "script") return { cause: "auto", why: "script" };
+  if (dom === "automation" || et === "automation_triggered") return { cause: "auto", why: "automation" };
+  if (u && et === "call_service") return humans && humans.has(u) ? { cause: "human", why: "human" } : { cause: "auto", why: "unlinked_user" };   // a user id that no person.* entity points to
+  return { cause: "auto", why: "other" };
 }
+function sfcpCause(x, humans) { return sfcpWhy(x, humans).cause; }
 function sfcpDomain(id) { return String(id).split(".")[0]; }
 function sfcpLocalDay(ms) { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime(); }
 function sfcpMinute(ms) { const d = new Date(ms); return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60; }

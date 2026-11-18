@@ -27,6 +27,7 @@ const SFCP_CSS = `
   .cf { display:flex; align-items:center; gap:8px; margin:8px 0 0 30px; font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--dim); }
   .cf .tr { flex:1; max-width:160px; height:5px; border-radius:3px; background:rgb(var(--c-rgb) / .12); overflow:hidden; } .cf .tr b { display:block; height:100%; background:var(--c); }
   .badge { margin:8px 0 0 30px; font-size:11.5px; color:var(--a); } .done .badge { color:var(--g); }
+  .badge.warn { color:var(--a); font-weight:600; } .foot .diag { margin:0; flex-basis:100%; } .foot .diag div { margin-top:4px; line-height:1.6; }
   .acts { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 0 30px; }
   button { font:inherit; font-size:11.5px; min-height:40px; padding:6px 12px; border-radius:8px; border:1px solid rgb(var(--c-rgb) / .3); background:rgb(var(--c-rgb) / .06); color:var(--tx); cursor:pointer; }
   button:hover { border-color:var(--c); } button:focus-visible { outline:2px solid var(--c); outline-offset:2px; }

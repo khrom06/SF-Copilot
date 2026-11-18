@@ -3,7 +3,7 @@ import fs from "node:fs"; import path from "node:path"; import vm from "node:vm"
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 export function load() {
   const ctx = vm.createContext({ console, Math, Date, JSON, Map, Set, Number, String, Array, Object, isFinite, isNaN });
-  const code = ["10-engine.js", "20-automation.js"].map((f) => fs.readFileSync(path.join(root, "src", f), "utf8")).join("\n");
-  vm.runInContext(code + "\n;globalThis.__x = { sfcpAnalyze, sfcpActions, sfcpCause, sfcpReliability, sfcpSun, sfcpDays, sfcpAutomation, sfcpYaml, sfcpAction, sfcpHHMM };", ctx, { filename: "src" });
+  const code = ["10-engine.js", "20-automation.js", "25-overlap.js"].map((f) => fs.readFileSync(path.join(root, "src", f), "utf8")).join("\n");
+  vm.runInContext(code + "\n;globalThis.__x = { sfcpAnalyze, sfcpActions, sfcpCause, sfcpOverlap, sfcpLeaves, sfcpIntent, sfcpSameTrigger, sfcpTrialSince, sfcpWhy, sfcpRisk, sfcpSafeAction, sfcpReliability, sfcpSun, sfcpDays, sfcpAutomation, sfcpYaml, sfcpAction, sfcpHHMM };", ctx, { filename: "src" });
   return ctx.__x;
 }

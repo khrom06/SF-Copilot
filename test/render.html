@@ -43,21 +43,38 @@ function makeHass(opts = {}) {
     "switch.heat": S("off", { friendly_name: "Heating" }), "light.flaky": S("on", { friendly_name: "Flaky lamp" }), "switch.screensaver": S("on", { friendly_name: "Screensaver" }),
     "person.alex": S("home", { user_id: USER, friendly_name: "Alex" }), "sensor.temp": S("20", { unit_of_measurement: "°C" }), ...(opts.extra || {}) };
   for (const [id, s] of Object.entries(states)) s.entity_id = id;
-  const log = { ws: [], api: [], userData: opts.userData || null };
-  const h = { states, entities: {}, locale: { language: opts.lang || "fr" }, language: opts.lang || "fr", user: { id: USER, is_admin: opts.admin !== false }, themes: { darkMode: true },
+  const log = { ws: [], api: [], get: [], configs: opts.configs || {}, userData: opts.userData || null };
+  const h = { states, entities: {}, locale: { language: opts.lang || "fr" }, language: opts.lang || "fr", user: "user" in opts ? opts.user : { id: USER, is_admin: opts.admin !== false }, themes: { darkMode: true },
     config: { latitude: 44.84, longitude: -0.58 }, __log: log,
     callWS: async (m) => { log.ws.push(m);
       if (opts.wsFail) throw new Error("logbook down");
       if (m.type === "logbook/get_events") { const a = Date.parse(m.start_time) / 1000, b = Date.parse(m.end_time) / 1000, ids = new Set(m.entity_ids); return HIST.filter((x) => ids.has(x.entity_id) && x.when >= a && x.when <= b); }
+      if (m.type === "search/related") { if (opts.relatedFails) throw new Error("not allowed"); return { automation: (opts.related || {})[m.item_id] || [] }; }
       if (m.type === "frontend/get_user_data") return { value: log.userData };
       if (m.type === "frontend/set_user_data") { log.userData = m.value; return null; }
       throw new Error("unknown " + m.type); },
-    callApi: async (method, path, body) => { log.api.push({ method, path, body }); if (opts.apiFail) { const e = new Error("forbidden"); throw e; } return { result: "ok" }; } };
+    // fake automation config API: GET reads, POST writes, DELETE removes; `serverRefuses` = the server answers 401 to a non-administrator whatever the card does
+    callApi: async (method, path, body) => { const id = path.replace(/^config\/automation\/config\//, "");
+      if (opts.serverRefuses) { (method === "GET" ? log.get : log.api).push({ method, path, body, refused: true }); throw { status_code: 401, body: { message: "Unauthorized" } }; }
+      if (method === "GET") { log.get.push(path); if (!(id in log.configs)) throw { status_code: 404, body: { message: "Resource not found" } }; return log.configs[id]; }
+      log.api.push({ method, path, body }); if (opts.apiFail) { const e = new Error("forbidden"); throw e; }
+      if (method === "POST") log.configs[id] = body; if (method === "DELETE") delete log.configs[id]; return { result: "ok" }; } };
   return h;
 }
 const mount = (cfg, h) => { const el = document.createElement("sf-copilot-card"); el.setConfig(cfg || {}); document.body.appendChild(el); el.hass = h; return el; };
-const txt = (el) => el.shadowRoot.textContent.replace(/\s+/g, " ");
+const txt = (el) => { const h = el.shadowRoot.querySelector(".hud"); return (h ? h.textContent : el.shadowRoot.textContent).replace(/\s+/g, " "); };
 const btns = (el, k) => [...el.shadowRoot.querySelectorAll(`button[data-k="${k}"]`)];
+const pid = (el, re) => card(el, re).querySelector("[data-id]").dataset.id;
+const proposal = (el, re) => el._res.proposals.find((x) => el._sentence(x) && re.test(el._sentence(x)));
+// a dry run as Home Assistant would show it: the automation entity (state, last run) and its stored config (start date in the description)
+function trialOf(h, id, o = {}) {
+  const since = o.since ?? NOW - 8 * DAY;
+  if (o.config !== false) h.__log.configs[`sf_copilot_trial_${id}`] = { alias: "SF Copilot · x", description: "d" + (o.marker === false ? "" : "\nsf-copilot-trial-since: " + new Date(since).toISOString()), triggers: [], actions: [] };
+  h.states = { ...h.states, "automation.sf_copilot_trial": { entity_id: "automation.sf_copilot_trial", state: o.state || "on", attributes: { id: `sf_copilot_trial_${id}`, last_triggered: o.last === null ? null : new Date(o.last ?? NOW - 2 * 3600000).toISOString() }, last_changed: new Date(o.changed ?? since).toISOString() } };
+}
+// an automation that already exists in the fake Home Assistant (entity, and the config the admin API returns for its id)
+function autoOf(h, id, config, o = {}) { if (config) h.__log.configs[id] = config; h.states = { ...h.states, ["automation." + id]: { entity_id: "automation." + id, state: o.state || "on", attributes: { id: o.noId ? undefined : id, friendly_name: o.name || id }, last_changed: new Date(NOW).toISOString() } }; }
+const DESK_AT_1930 = { alias: "Desk in the evening", triggers: [{ trigger: "time", at: "19:30:00" }], conditions: [], actions: [{ action: "light.turn_on", target: { entity_id: "light.desk" } }] };
 const card = (el, re) => [...el.shadowRoot.querySelectorAll(".p")].find((p) => re.test(p.querySelector(".ti").textContent));
 
 (async () => { try {
@@ -82,39 +99,90 @@ const card = (el, re) => [...el.shadowRoot.querySelectorAll(".p")].find((p) => r
     for (let i = 0; i < 20; i++) { h.states = { ...h.states, "sensor.temp": S(String(20 + i)) }; el.hass = { ...h }; } await wait(80);
     ok(writes === 0, "unrelated state changes must not rewrite the card, got " + writes); ok(h.__log.ws.filter((m) => m.type === "logbook/get_events").length === 2, "hass updates never start a new scan");
     el.remove(); }
-  // 2. Dry run, create (two presses), trial shown, promote, stop.
+  // 2. The journey: a fresh proposal offers only a dry run (no "create"); the dry run is stamped, observed, then promoted in two presses.
   { const h = makeHass(), el = mount({}, h); await until(() => el._res);
-    const pc = () => card(el, /Desk lamp/), id = pc().querySelector("[data-id]").dataset.id;
+    const pc = () => card(el, /Desk lamp/), id = pid(el, /Desk lamp/);
+    ok(pc().querySelector('[data-k="trial"]') && !pc().querySelector('[data-k="create"]') && !pc().querySelector('[data-k="promote"]'), "default: a new proposal offers a dry run, never a direct creation");
     pc().querySelector('[data-k="trial"]').click(); await until(() => h.__log.api.length === 1); await idle(el);
     const a = h.__log.api[0];
     ok(a && a.method === "POST" && a.path === `config/automation/config/sf_copilot_trial_${id}`, "dry run: POST of the card's own trial automation, got " + JSON.stringify(a && [a.method, a.path]));
     ok(a && a.body.actions.length === 1 && a.body.actions[0].action === "logbook.log" && !JSON.stringify(a.body).includes("turn_on"), "dry run: the automation only writes in the logbook");
     ok(a && a.body.triggers[0].trigger === "time" && /^SF Copilot · Allumer Desk lamp/.test(a.body.alias), "dry run: time trigger and a readable name");
-    // create: the first press only arms the button
+    ok(a && /\nsf-copilot-trial-since: \d{4}-\d\d-\d\dT[\d:.]+Z$/.test(a.body.description), "dry run: its start date is written in the automation, to survive a restart");
+    // just created: observed, cannot be promoted yet, says how long is left
+    trialOf(h, id, { since: Date.now(), last: null, changed: Date.now() }); el.hass = { ...h }; await wait(60);
+    ok(pc().classList.contains("trial") && !pc().querySelector('[data-k="promote"]') && pc().querySelector('[data-k="stop"]') && /Création possible dans 7 j/.test(pc().textContent.replace(/\s+/g, " ")), "a young dry run cannot be promoted: " + pc().textContent.replace(/\s+/g, " ").slice(0, 300));
+    el.remove(); }
+  // 2b. Legacy path, explicitly enabled: require_trial false gives the direct create (two presses, expiring confirmation).
+  { const h = makeHass(), el = mount({ require_trial: false }, h); await until(() => el._res);
+    const pc = () => card(el, /Desk lamp/), id = pid(el, /Desk lamp/);
     pc().querySelector('[data-k="create"]').click(); await wait(30);
-    ok(h.__log.api.length === 1, "create: the first press must not create anything");
+    ok(h.__log.api.length === 0, "create: the first press must not create anything");
     ok(pc().querySelector('[data-k="create"]').textContent === "Confirmer ?", "create: the first press asks for confirmation");
-    pc().querySelector('[data-k="create"]').click(); await until(() => h.__log.api.length === 2); await idle(el);
-    const c = h.__log.api[1]; ok(c && c.path === `config/automation/config/sf_copilot_${id}` && c.body.actions[0].action === "light.turn_on" && c.body.actions[0].target.entity_id === "light.desk", "create: the second press creates the real automation");
-    // the confirmation expires
+    pc().querySelector('[data-k="create"]').click(); await until(() => h.__log.api.length === 1); await idle(el);
+    const c = h.__log.api[0]; ok(c && c.path === `config/automation/config/sf_copilot_${id}` && c.body.actions[0].action === "light.turn_on" && c.body.actions[0].target.entity_id === "light.desk", "create: the second press creates the real automation");
     const pl = () => card(el, /Hall light/); pl().querySelector('[data-k="create"]').click(); await wait(4300); await wait(30);
     ok(pl().querySelector('[data-k="create"]').textContent !== "Confirmer ?", "create: the confirmation expires after 4 s");
-    pl().querySelector('[data-k="create"]').click(); await wait(30); ok(h.__log.api.length === 2, "create: a press after the expiry arms again, it does not create");
-    // the trial appears in Home Assistant: shown as on trial, with promote and stop
-    h.states = { ...h.states, "automation.sf_copilot_trial": { entity_id: "automation.sf_copilot_trial", state: "on", attributes: { id: `sf_copilot_trial_${id}`, last_triggered: new Date(NOW - 2 * 3600000).toISOString() }, last_changed: new Date(NOW - 3 * DAY).toISOString() } };
-    el.hass = { ...h }; await wait(40);
-    ok(pc().classList.contains("trial") && /À l'essai depuis il y a 3 j · aurait agi il y a 2 h/.test(pc().textContent.replace(/\s+/g, " ")), "a trial is shown with when it would have acted: " + pc().textContent.replace(/\s+/g, " ").slice(0, 300));
-    ok(pc().querySelector('[data-k="promote"]') && pc().querySelector('[data-k="stop"]') && !pc().querySelector('[data-k="trial"]'), "a trial offers promote and stop");
-    pc().querySelector('[data-k="promote"]').click(); await wait(30); ok(h.__log.api.length === 2, "promote needs two presses");
-    pc().querySelector('[data-k="promote"]').click(); await until(() => h.__log.api.length === 4);
-    ok(h.__log.api[2].method === "POST" && h.__log.api[2].path === `config/automation/config/sf_copilot_${id}` && h.__log.api[3].method === "DELETE" && h.__log.api[3].path === `config/automation/config/sf_copilot_trial_${id}`, "promote: create the real one, then delete the trial");
+    pl().querySelector('[data-k="create"]').click(); await wait(30); ok(h.__log.api.length === 1, "create: a press after the expiry arms again, it does not create");
     // the real one exists: only an "open" button
-    h.states = { ...h.states, "automation.sf_copilot_real": { entity_id: "automation.sf_copilot_real", state: "on", attributes: { id: `sf_copilot_${id}` }, last_changed: new Date().toISOString() } }; delete h.states["automation.sf_copilot_trial"];
+    h.states = { ...h.states, "automation.sf_copilot_real": { entity_id: "automation.sf_copilot_real", state: "on", attributes: { id: `sf_copilot_${id}` }, last_changed: new Date().toISOString() } };
     el.hass = { ...h }; await wait(40);
     ok(pc().classList.contains("done") && /Automatisation créée/.test(pc().textContent) && pc().querySelector('[data-k="open"]') && !pc().querySelector('[data-k="create"]'), "a created automation is shown as done, with a link");
     let more = null; el.addEventListener("hass-more-info", (e) => { more = e.detail.entityId; }); pc().querySelector('[data-k="open"]').click(); ok(more === "automation.sf_copilot_real", "open shows the automation's dialog");
     ok(h.__log.api.every((x) => /^config\/automation\/config\/sf_copilot_/.test(x.path)), "only the card's own automations are ever written");
     el.remove(); }
+  // 2c. A mature dry run (8 days, acted 2 h ago) is promoted in two presses: real one created, trial deleted. A restart of Home Assistant
+  //     (entity last_changed reset to now) must not reset the observation: the start date comes from the automation itself.
+  { const h = makeHass(), el = mount({}, h); await until(() => el._res);
+    const pc = () => card(el, /Desk lamp/), id = pid(el, /Desk lamp/);
+    trialOf(h, id, { changed: Date.now() }); el.hass = { ...h }; await until(() => el._since && el._since[id]); await wait(40);
+    ok(pc().classList.contains("trial") && /À l'essai depuis/.test(pc().textContent), "a trial is shown as such");
+    ok(pc().querySelector('[data-k="promote"]') && pc().querySelector('[data-k="stop"]') && !pc().querySelector('[data-k="trial"]'), "a mature trial offers promote and stop, even right after a Home Assistant restart: ");
+    pc().querySelector('[data-k="promote"]').click(); await wait(30); ok(h.__log.api.length === 0, "promote needs two presses");
+    pc().querySelector('[data-k="promote"]').click(); await until(() => h.__log.api.length === 2); await idle(el);
+    ok(h.__log.api[0].method === "POST" && h.__log.api[0].path === `config/automation/config/sf_copilot_${id}` && h.__log.api[0].body.actions[0].action === "light.turn_on" && h.__log.api[1].method === "DELETE" && h.__log.api[1].path === `config/automation/config/sf_copilot_trial_${id}`, "promote: create the real one, then delete the trial");
+    el.remove(); }
+  // 2d. The rule holds in the code, not only in the buttons: every way of reaching a real creation without a good dry run is refused.
+  { const cases = [
+      ["no dry run at all", (h, id) => {}, /Lancez d'abord un essai/],
+      ["a dry run of 2 days", (h, id) => trialOf(h, id, { since: NOW - 2 * DAY }), /pas encore duré 7 j/],
+      ["a dry run that never acted", (h, id) => trialOf(h, id, { last: null }), /jamais agi/],
+      ["a dry run that acted before it started", (h, id) => trialOf(h, id, { last: NOW - 20 * DAY }), /jamais agi/],
+      ["a dry run turned off", (h, id) => trialOf(h, id, { state: "off" }), /désactivé/],
+      ["a dry run without a start date (edited by hand)", (h, id) => trialOf(h, id, { marker: false }), /illisible/],
+      ["a dry run deleted by hand after the page was loaded", (h, id) => trialOf(h, id, { config: false }), /illisible/] ];
+    for (const [name, setup, re] of cases) {
+      const h = makeHass(), el = mount({}, h); await until(() => el._res); const id = pid(el, /Desk lamp/), p = proposal(el, /Desk lamp/);
+      setup(h, id); el.hass = { ...h }; await wait(40);
+      let err = null; try { await el._save(p, "real"); } catch (e) { err = e; }
+      ok(err && re.test(err.message), `real creation refused (${name}), got ${err && err.message}`); ok(h.__log.api.length === 0, `nothing written (${name})`);
+      el._doing = null; el._armed = `promote|${id}`; await el._do("promote", p); ok(h.__log.api.length === 0, `promote writes nothing (${name})`);
+      el.remove(); }
+    // the existing automation is never replaced (a person edited it, or an id collides)
+    for (const [name, key] of [["real", (id) => `sf_copilot_${id}`], ["trial", (id) => `sf_copilot_trial_${id}`]]) {
+      const h = makeHass(), el = mount({}, h); await until(() => el._res); const id = pid(el, /Desk lamp/), p = proposal(el, /Desk lamp/);
+      if (name === "real") trialOf(h, id); h.__log.configs[key(id)] = h.__log.configs[key(id)] || { alias: "mine", actions: [] }; const mine = JSON.stringify(h.__log.configs[key(id)]);
+      let err = null; try { await el._save(p, name === "real" ? "real" : "trial"); } catch (e) { err = e; }
+      ok(err && /existe déjà/.test(err.message) && h.__log.api.length === 0 && JSON.stringify(h.__log.configs[key(id)]) === mine, `an existing ${name} automation is not overwritten, got ${err && err.message}`); el.remove(); } }
+  // 2e. Roles. Unknown or malformed administrator status never opens the buttons (fail closed), in the screen and in the code.
+  { for (const [name, user, re] of [["no user object", undefined, /Statut administrateur inconnu/], ["user without is_admin", { id: USER }, /Seul un administrateur/], ["is_admin as a string", { id: USER, is_admin: "true" }, /Seul un administrateur/], ["is_admin null", { id: USER, is_admin: null }, /Seul un administrateur/], ["is_admin false", { id: USER, is_admin: false }, /Seul un administrateur/]]) {
+      const h = makeHass({ user }), el = mount({}, h); await until(() => el._res); const p = proposal(el, /Desk lamp/);
+      ok(/Desk lamp/.test(txt(el)) && !btns(el, "trial").length && !btns(el, "create").length && !btns(el, "promote").length && !btns(el, "ignore").length && re.test(txt(el)), `${name}: proposals are read-only, with the reason`);
+      let err = null; try { await el._save(p, "trial"); } catch (e) { err = e; } ok(err && h.__log.api.length === 0 && h.__log.get.length === 0, `${name}: the code refuses too, and does not even read the automation API`);
+      el.remove(); }
+    const h = makeHass(), el = mount({}, h); await until(() => el._res); ok(btns(el, "trial").length > 0, "an administrator (is_admin === true) gets the buttons");
+    // permissions removed after the card was loaded: the screen follows and a button captured earlier does nothing
+    const stale = btns(el, "trial")[0], id = stale.dataset.id; el.hass = { ...h, user: { id: USER, is_admin: false } }; await wait(40);
+    ok(!btns(el, "trial").length && /Seul un administrateur/.test(txt(el)), "an administrator who loses the right is read-only at the next update");
+    stale.click(); await wait(80); ok(h.__log.api.length === 0 && /Seul un administrateur/.test(txt(el)), "a button captured before the change writes nothing");
+    el.remove();
+    // same for "stop" (a DELETE that does not go through _save): a stale button must not delete after the right was lost
+    { const h2 = makeHass(), e2 = mount({}, h2); await until(() => e2._res); trialOf(h2, pid(e2, /Desk lamp/)); e2.hass = { ...h2 }; await until(() => e2._since && e2._since[pid(e2, /Desk lamp/)]); await wait(40);
+      const stop = btns(e2, "stop")[0]; ok(!!stop, "an administrator sees stop on a trial"); e2.hass = { ...h2, user: { id: USER, is_admin: false } }; await wait(40); stop.click(); await wait(80);
+      ok(h2.__log.api.length === 0, "a stale stop button deletes nothing once the right is lost"); e2.remove(); }
+    // the server is what protects: a card that thinks it is administrator but whose user the server refuses writes nothing and says so
+    const hs = makeHass({ serverRefuses: true }), es = mount({}, hs); await until(() => es._res); card(es, /Desk lamp/).querySelector('[data-k="trial"]').click(); await until(() => /Échec/.test(txt(es)));
+    ok(/Échec/.test(txt(es)) && Object.keys(hs.__log.configs).length === 0 && hs.__log.api.every((x) => x.refused), "a server refusal (401) is shown as a failure and nothing is stored"); es.remove(); }
   // 3. Ignore: per user, remembered, can be undone.
   { const h = makeHass(), el = mount({}, h); await until(() => el._res); await wait(30);
     card(el, /Hall light/).querySelector('[data-k="ignore"]').click(); await until(() => h.__log.userData); await idle(el);
@@ -159,8 +227,88 @@ const card = (el, re) => [...el.shadowRoot.querySelectorAll(".p")].find((p) => r
     ok(/Allumer Reading lamp à 21:/.test(txt(el)), "less clear habits: the weak routine appears: " + txt(el).slice(0, 300));
     ok(h.__log.ws.filter((m) => m.type === "logbook/get_events").length === before, "less clear habits: the history is not read again");
     btns(el, "loose")[0].click(); await wait(30); ok(!/Reading lamp/.test(txt(el)), "only clear habits again"); el.remove(); }
+  // 6c. Safety policy on a house with a lock, a garage door, a shutter and a thermostat, each used by hand every weekday.
+  { const me = (dom) => ({ context_user_id: USER, context_event_type: "call_service", context_domain: dom }), auto = { context_event_type: "automation_triggered", context_domain: "automation" };
+    const habit = (e, to, from, dom, hh) => { let n = 0; for (let k = 1; k <= 21; k++) { const d = day(k); if (isWe(d)) continue; n++; HIST.push({ entity_id: e, state: from, when: (d + 3600000) / 1000, ...auto }); if (n % 7) HIST.push({ entity_id: e, state: to, when: (d + (hh * 60 + Math.round(rnd() * 14 - 7)) * MIN) / 1000, ...me(dom) }); } };
+    habit("lock.front", "unlocked", "locked", "lock", 18); habit("cover.garage", "open", "closed", "cover", 8); habit("cover.shutter", "open", "closed", "cover", 9); habit("cover.garage2", "closed", "open", "cover", 22); habit("climate.living", "heat", "off", "climate", 7); habit("lock.back", "locked", "unlocked", "lock", 23);
+    const house = { "lock.front": S("locked", { friendly_name: "Front door lock" }), "lock.back": S("unlocked", { friendly_name: "Back door lock" }), "cover.garage": S("closed", { friendly_name: "Garage door", device_class: "garage" }), "cover.garage2": S("open", { friendly_name: "Second garage", device_class: "garage" }),
+      "cover.shutter": S("closed", { friendly_name: "Shutter" }), "climate.living": S("off", { friendly_name: "Living heat" }) };
+    const none = () => { const h = makeHass({ extra: house }); return h; };
+    // default: nothing dangerous is proposed, it is counted and named, and the code refuses even if the proposal is forced
+    { const h = none(), el = mount({ max: 30 }, h); await until(() => el._res); await wait(30); const t = txt(el);
+      ok(!card(el, /Déverrouiller Front|Ouvrir Garage|Ouvrir Shutter|Fermer Second/) && /4 proposition\(s\) bloquée\(s\)/.test(t) && /Déverrouiller Front door lock/.test(t), "default: unlock / open cover / garage proposals are blocked and listed, not offered: " + t.slice(0, 500));
+      ok(card(el, /Verrouiller Back door/) && !card(el, /Verrouiller Back door/).querySelector(".badge.warn"), "default: locking a door is allowed without warning"); ok(card(el, /Living heat/) && /Action sensible/.test(card(el, /Living heat/).textContent), "default: a thermostat mode change is allowed but flagged as sensitive");
+      for (const [re, name] of [[/Déverrouiller Front/, "unlock"], [/Ouvrir Garage door/, "open garage"], [/Ouvrir Shutter/, "open shutter"], [/Fermer Second garage/, "close garage"]]) {
+        const p = proposal(el, re); ok(p, name + ": the engine does find the habit (the policy is what stops it)"); if (!p) continue;
+        for (const mode of ["trial", "real"]) { let err = null; try { await el._save(p, mode); } catch (e) { err = e; } ok(err && /politique de sécurité/.test(err.message), `${name}: ${mode} refused by the policy, got ${err && err.message}`); }
+        el._armed = `trial|${p.id}`; await el._do("trial", p); ok(!/Seul/.test(txt(el)), name + ": forced through the button handler"); }
+      ok(h.__log.api.length === 0 && h.__log.get.length === 0, "default: no write and no read for any blocked proposal"); el.remove(); }
+    // explicit opt-in, one token at a time
+    for (const [allow, shows, hides] of [[["unlock"], /Déverrouiller Front/, /Ouvrir Garage|Ouvrir Shutter|Fermer Second/], [["open_cover"], /Ouvrir Shutter/, /Déverrouiller Front|Ouvrir Garage|Fermer Second garage/], [["access"], /Fermer Second garage/ , /Ouvrir Garage door|Ouvrir Shutter|Déverrouiller/], [["open_cover", "access"], /Ouvrir Garage door/, /Déverrouiller/], [["bogus", 3, null], null, /Déverrouiller|Ouvrir Garage/]]) {
+      const h = none(), el = mount({ allow, max: 30 }, h); await until(() => el._res); await wait(30); const t = txt(el);
+      ok((!shows || card(el, shows)) && !card(el, hides), `allow ${JSON.stringify(allow)}: ${shows} offered, ${hides} not offered: ` + [...el.shadowRoot.querySelectorAll(".p .ti")].map((x) => x.textContent).join(" | "));
+      if (shows) { const b = card(el, shows); ok(b && /Action à risque|Action sensible/.test(b.textContent) && b.querySelector(".badge.warn"), `allow ${JSON.stringify(allow)}: the allowed risky action is marked`); } el.remove(); }
+    // an unknown device_class on a cover does not make it a shutter for the "access" rule when the class says garage
+    { const h = none(), el = mount({ allow: ["open_cover"], max: 30 }, h); await until(() => el._res); await wait(30); ok(!card(el, /Ouvrir Garage door/) && card(el, /Ouvrir Shutter/), "open_cover alone never opens a garage door"); el.remove(); } }
+  // 6d. Who counts as a human, and what the card says when nobody does.
+  { const me = (u, dom) => ({ context_user_id: u, context_event_type: "call_service", context_domain: dom });
+    let n = 0; for (let k = 1; k <= 21; k++) { const d = day(k); if (isWe(d)) continue; n++; HIST.push({ entity_id: "light.bea", state: "off", when: (d + 3600000) / 1000, context_event_type: "automation_triggered", context_domain: "automation" }); HIST.push({ entity_id: "light.bea", state: "on", when: (d + (20 * 60 + Math.round(rnd() * 14 - 7)) * MIN) / 1000, ...me("u-bea", "light") });
+      HIST.push({ entity_id: "light.carl", state: "off", when: (d + 3600000) / 1000, context_event_type: "automation_triggered", context_domain: "automation" }); HIST.push({ entity_id: "light.carl", state: "on", when: (d + (21 * 60 + Math.round(rnd() * 14 - 7)) * MIN) / 1000, ...me("u-carl", "light") }); }
+    const extra = { "light.bea": S("off", { friendly_name: "Bea lamp" }), "light.carl": S("off", { friendly_name: "Carl lamp" }), "person.bea": S("home", { user_id: "u-bea", friendly_name: "Bea" }), "person.guest": S("home", { friendly_name: "Guest" }) };
+    // several users, several persons, one account (Carl) without a person: Alex and Bea are counted, Carl is explained and never promoted to human
+    { const h = makeHass({ extra }), el = mount({}, h); await until(() => el._res); await wait(30); const t = txt(el), dg = el._diag;
+      ok(/Allumer Bea lamp à (19:5|20:)/.test(t) && /Allumer Desk lamp/.test(t), "two linked users both get their habits: " + t.slice(0, 300)); ok(!/Carl lamp/.test(t.replace(/Carl lamp[^]*?$/, "")) || !card(el, /Carl lamp/), "an account with no person is not turned into a human");
+      ok(dg && dg.cause.human > 20 && dg.why.unlinked_user >= 14 && dg.unlinked.size === 2 && dg.humans === 2 && dg.me === true, "the detection is counted by cause: " + JSON.stringify(dg && { c: dg.cause, w: dg.why, u: dg.unlinked.size }));
+      ok(/Détection : \d+ humaines · \d+ automatiques · \d+ physiques/.test(t) && /faits par un compte sans personne associée/.test(t) && /événements faits par un compte sans personne associée \(ignorés\)/.test(t), "the details explain what was ignored: " + t.slice(-600)); ok(!el.shadowRoot.querySelector('[role="alert"]'), "no warning when the configuration is sound"); el.remove(); }
+    // nobody is linked: a clear warning instead of a silent empty card
+    { const h = makeHass(), el0 = null; for (const k of Object.keys(h.states)) if (k.startsWith("person.")) delete h.states[k]; const el = mount({}, h); await until(() => el._res); await wait(30);
+      ok(/Aucune entité « person » n'est reliée/.test(txt(el)) && el.shadowRoot.querySelector('[role="alert"]') && /Aucune habitude/.test(txt(el)) && el._diag.humans === 0, "no person linked: a warning, not just an empty result: " + txt(el).slice(0, 400)); el.remove(); }
+    // a person exists, but not for the account that is looking
+    { const h = makeHass({ user: { id: "u-zed", is_admin: true } }), el = mount({}, h); await until(() => el._res); await wait(30);
+      ok(/Votre compte n'est relié à aucune personne/.test(txt(el)) && el.shadowRoot.querySelector('[role="alert"]'), "the current account is not linked to a person: warned"); el.remove(); }
+    // wall switches: counted, said to be ignored by default
+    { const h = makeHass(), el = mount({}, h); await until(() => el._res); await wait(30); ok(el._diag.cause.physical > 0 && /sans contexte/.test(txt(el)) && /option physical: false/.test(txt(el)), "events with no context are counted and the card says they are ignored"); el.remove(); } }
+  // 6e. Existing automations: a duplicate is hidden and named, an overlap is flagged, what cannot be read is counted. Administrators only.
+  { // duplicate by entity, by registry area, disabled one, overlap, unreadable, own automations ignored
+    { const h = makeHass(); autoOf(h, "evening_desk", DESK_AT_1930, { name: "Desk in the evening" });
+      autoOf(h, "hall_off", { alias: "Hall off at noon", triggers: [{ trigger: "time", at: "12:00:00" }], actions: [{ action: "light.turn_off", target: { entity_id: "light.hall" } }] }, { name: "Hall off at noon" });
+      autoOf(h, "yaml_only", null, { noId: true }); autoOf(h, "broken", null, {}); autoOf(h, "sf_copilot_trial_zzz", { alias: "own", triggers: [], actions: [{ action: "light.turn_on", target: { entity_id: "light.desk" } }] });
+      const el = mount({}, h); await until(() => el._res); await until(() => el._autos); await wait(40);
+      ok(!card(el, /Desk lamp/) && /1 proposition\(s\) déjà couverte\(s\) par une automatisation existante/.test(txt(el)) && /Desk in the evening/.test(txt(el)), "a duplicate is hidden and named: " + txt(el).slice(0, 300));
+      const hl = card(el, /Hall light/); ok(hl && /Une automatisation agit déjà sur cette entité : Hall off at noon/.test(hl.textContent) && hl.querySelector('[data-k="trial"]'), "an overlap is flagged but the proposal stays offered");
+      ok(/Doublons : 2 automatisations lues, 2 non lisibles \(écrites en YAML/.test(txt(el)), "what could not be read is counted: " + txt(el).slice(-300));
+      ok(h.__log.get.some((g) => g === "config/automation/config/evening_desk") && !el._autos.items.some((x) => /sf_copilot_/.test(x.id)) && h.__log.api.length === 0, "the card reads the others' configs, never counts its own, and writes nothing"); el.remove(); }
+    // rescan re-reads; a duplicate through the registry (area)
+    { const h = makeHass(); h.entities = { "light.desk": { area_id: "office" } }; autoOf(h, "office_lights", { alias: "Office lights", triggers: [{ trigger: "time", at: "19:20:00" }], actions: [{ action: "light.turn_on", target: { area_id: "office" } }] }, { name: "Office lights" });
+      const el = mount({}, h); await until(() => el._res); await until(() => el._autos); await wait(40); ok(!card(el, /Desk lamp/) && /Office lights/.test(txt(el)), "a duplicate through an area target is found with the registry"); el.remove(); }
+    // a disabled duplicate does not hide (it does nothing), but is shown
+    { const h = makeHass(); autoOf(h, "evening_desk", DESK_AT_1930, { state: "off", name: "Desk in the evening" }); const el = mount({}, h); await until(() => el._res); await until(() => el._autos); await wait(40);
+      ok(card(el, /Desk lamp/) && /Une automatisation agit déjà sur cette entité : Desk in the evening/.test(card(el, /Desk lamp/).textContent), "a disabled duplicate is flagged, not hidden"); el.remove(); }
+    // a script that names the entity: said, not guessed
+    { const h = makeHass(); autoOf(h, "evening_script", { alias: "Evening", triggers: [{ trigger: "time", at: "19:25:00" }], actions: [{ action: "script.evening", data: { lamp: "light.desk" } }] }, { name: "Evening" }); const el = mount({}, h); await until(() => el._res); await until(() => el._autos); await wait(40);
+      ok(card(el, /Desk lamp/) && /Peut-être déjà concernée \(script, scène, modèle\) : Evening/.test(card(el, /Desk lamp/).textContent), "a script naming the entity is flagged as maybe"); el.remove(); }
+    // not an administrator: the config API is not even asked, nothing is hidden or flagged
+    { const h = makeHass({ admin: false }); autoOf(h, "evening_desk", DESK_AT_1930); const el = mount({}, h); await until(() => el._res); await wait(80);
+      ok(h.__log.get.length === 0 && /Desk lamp/.test(txt(el)) && !/déjà couverte|Doublons/.test(txt(el)), "a non-administrator: no read of the automation API, no verdict"); el.remove(); }
+    // the proposal already made (trial / real) is never hidden by... itself, and a duplicate created after the trial blocks the promotion in the code
+    { const h = makeHass(), el = mount({}, h); await until(() => el._res); await until(() => el._autos); const id = pid(el, /Desk lamp/), p = proposal(el, /Desk lamp/);
+      trialOf(h, id); el.hass = { ...h }; await until(() => el._since && el._since[id]); await wait(40); ok(card(el, /Desk lamp/) && card(el, /Desk lamp/).querySelector('[data-k="promote"]'), "a mature trial can be promoted while nothing covers it");
+      autoOf(h, "made_meanwhile", DESK_AT_1930, { name: "Made meanwhile" }); el.hass = { ...h };
+      let err = null; try { await el._save(p, "real"); } catch (e) { err = e; } ok(err && /Déjà couverte par « Made meanwhile »/.test(err.message) && h.__log.api.length === 0, "an automation made during the dry run blocks the real creation, read again at that moment: " + (err && err.message));
+      el._armed = `promote|${id}`; await el._do("promote", p); ok(h.__log.api.length === 0 && /Déjà couverte/.test(txt(el)), "the promote button writes nothing and says why");
+      // a disabled duplicate does not block
+      h.states["automation.made_meanwhile"] = { ...h.states["automation.made_meanwhile"], state: "off" }; h.__log.configs[`sf_copilot_${id}`] = undefined; delete h.__log.configs[`sf_copilot_${id}`]; el._doing = null; err = null; try { await el._save(p, "real"); } catch (e) { err = e; } ok(!err && h.__log.api.length === 1, "a disabled duplicate does not block the creation: " + (err && err.message)); el.remove(); }
+    // an automation written in YAML (not readable) that Home Assistant links to the entity: flagged as maybe, by name
+    { const h = makeHass({ related: { "light.desk": ["automation.package_lamp", "automation.evening_desk"] } }); autoOf(h, "package_lamp", null, { name: "Package lamp" }); autoOf(h, "other_pkg", null, { name: "Other package" }); const el = mount({}, h); await until(() => el._res); await until(() => el._rel && el._rel["light.desk"]); await wait(60);
+      const dl = card(el, /Desk lamp/); ok(dl && /Peut-être déjà concernée \(script, scène, modèle\) : Package lamp/.test(dl.textContent) && !/Other package|evening_desk/.test(dl.textContent), "an unreadable automation that Home Assistant relates to the entity is flagged by name (and an unrelated one is not): " + (dl && dl.textContent.slice(0, 200)));
+      ok(!/Other package|Package lamp/.test(card(el, /Hall light/).textContent), "...only on the proposals it relates to"); el.remove(); }
+    // the related search refused or absent: no verdict is invented
+    { const h = makeHass({ relatedFails: true }); autoOf(h, "package_lamp", null, { name: "Package lamp" }); const el = mount({}, h); await until(() => el._res); await until(() => el._rel && "light.desk" in el._rel); await wait(40); ok(card(el, /Desk lamp/) && !/Package lamp/.test(txt(el).replace(/Doublons[^]*$/, "")), "when the related search fails nothing is flagged and nothing throws"); el.remove(); }
+    // too many automations: capped, counted
+    { const h = makeHass(); for (let i = 0; i < 405; i++) autoOf(h, "a" + i, { alias: "a" + i, triggers: [], actions: [] }); const el = mount({}, h); await until(() => el._res); await until(() => el._autos, 8000); await wait(40);
+      ok(el._autos.n === 400 && el._autos.unread === 5 && /Doublons : 400 automatisations lues, 5 non lisibles/.test(txt(el)), "more than 400 automations: 400 read, the rest counted as unread: " + JSON.stringify([el._autos.n, el._autos.unread])); el.remove(); } }
   // 7. Removed while a confirmation is armed: no timer left behind.
-  { const h = makeHass(), el = mount({}, h); await until(() => el._res); card(el, /Desk lamp/).querySelector('[data-k="create"]').click(); el.remove();
+  { const h = makeHass(), el = mount({ require_trial: false }, h); await until(() => el._res); card(el, /Desk lamp/).querySelector('[data-k="create"]').click(); el.remove();
     ok(el._armT === null && el._armed === null, "removing the card clears the pending confirmation"); }
   for (const e of window.__errors) failures.push("JavaScript error: " + e);
 } catch (e) { failures.push("the test crashed: " + (e && e.stack || e)); }
